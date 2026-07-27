@@ -1,12 +1,29 @@
 import json
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from loguru import logger
 from backend.app.core.config import Settings
 
+def clean_json_loads(text: str) -> dict:
+    """Safely parse JSON responses that may be wrapped in markdown codeblocks."""
+    clean_text = text.strip()
+    if clean_text.startswith("```"):
+        lines = clean_text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        clean_text = "\n".join(lines).strip()
+    return json.loads(clean_text)
+
 class CandidateEvaluationService:
-    """Evaluates candidate technical answers against target JDs and resumes using Groq LLM."""
-    def __init__(self, api_key: str = Settings.GROQ_API_KEY, model: str = Settings.GROQ_MODEL):
-        self.client = AsyncGroq(api_key=api_key)
+    """Evaluates candidate technical answers against target JDs and resumes using DeepSeek LLM."""
+    def __init__(
+        self, 
+        api_key: str = Settings.DEEPSEEK_API_KEY, 
+        model: str = Settings.DEEPSEEK_MODEL,
+        base_url: str = Settings.DEEPSEEK_BASE_URL
+    ):
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
 
     async def evaluate_response(
@@ -60,7 +77,7 @@ You must output ONLY valid JSON matching this schema. Do not output markdown cod
                 response_format={"type": "json_object"}
             )
             response_text = chat_completion.choices[0].message.content
-            return json.loads(response_text)
+            return clean_json_loads(response_text)
         except Exception as e:
             logger.error(f"Error during candidate response evaluation: {e}")
             return self._get_empty_evaluation(f"Evaluation failed: {e}")

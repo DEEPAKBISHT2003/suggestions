@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { 
   Mic, 
@@ -13,10 +13,13 @@ import {
   Compass,
   FileText,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Volume2,
+  VolumeX,
+  Pin
 } from 'lucide-react';
 import { useCopilotAudio } from '../hooks/useCopilotAudio';
-import { stopCopilot, getCopilotStatus } from '../../api/copilot';
+import { stopCopilot, getCopilotStatus, finalizeCopilotReport } from '../../api/copilot';
 
 export const CopilotSession: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -28,17 +31,158 @@ export const CopilotSession: React.FC = () => {
     transcript, 
     intelligence, 
     assistance, 
+    questions,
+    togglePinQuestion,
     startConnection, 
     stopConnection
   } = useCopilotAudio(id || null);
 
   const [uiMode, setUiMode] = useState<'live' | 'report'>('live');
 
+  // Simulation mode check & audio control states
+  const searchParams = new URLSearchParams(window.location.search);
+  const isSimulation = searchParams.get('simulate') === 'true';
+
+  const [isSimulationFinished, setIsSimulationFinished] = useState<boolean>(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState<boolean>(false);
+  const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [volume, setVolume] = useState<number>(1.0);
+
+  const isMutedRef = React.useRef(isMuted);
+  const volumeRef = React.useRef(volume);
+
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+    volumeRef.current = volume;
+  }, [isMuted, volume]);
+
+  // Establish Copilot WebSocket connection on mount or when id changes
+  useEffect(() => {
+    if (id) {
+      startConnection();
+    }
+    return () => {
+      stopConnection();
+    };
+  }, [id]);
+
+  // Secondary connection to trigger audio simulation and receive binary audio frames if simulate=true
+  useEffect(() => {
+    if (!id) return;
+    const simulate = searchParams.get('simulate');
+    if (simulate !== 'true') return;
+
+    console.log('[Simulation] Initiating background simulation trigger connection...');
+    
+    let wsUrl = `ws://localhost:8000/api/ws/interview/${id}?mode=observer&simulate=true`;
+    const rawEnvUrl = import.meta.env.VITE_API_URL || 
+                      import.meta.env.VITE_BACKEND_URL;
+    if (rawEnvUrl) {
+      try {
+        const parsedUrl = new URL(rawEnvUrl);
+        const wsProtocol = parsedUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsUrl = `${wsProtocol}//${parsedUrl.host}/api/ws/interview/${id}?mode=observer&simulate=true`;
+      } catch (e) {
+        console.warn('[SimulationWS] Failed to parse env backend URL', e);
+      }
+    }
+
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    let audioCtx: AudioContext | null = null;
+    let gainNode: GainNode | null = null;
+    let nextPlayTime = 0;
+
+    ws.onopen = () => {
+      console.log('[SimulationWS] Simulation trigger WebSocket opened.');
+      try {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        audioCtx = new AudioContextClass();
+        gainNode = audioCtx.createGain();
+        gainNode.gain.value = isMutedRef.current ? 0 : volumeRef.current;
+        gainNode.connect(audioCtx.destination);
+        nextPlayTime = audioCtx.currentTime;
+      } catch (err) {
+        console.warn('[SimulationWS] Could not initialize Web Audio API Context:', err);
+      }
+    };
+
+    ws.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'simulation_complete') {
+            console.log('[SimulationWS] Audio simulation complete frame received.');
+            setIsSimulationFinished(true);
+          }
+        } catch (e) {
+          // ignore string parse errors
+        }
+        return;
+      }
+
+      if (event.data instanceof ArrayBuffer && audioCtx && gainNode) {
+        try {
+          if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+          }
+          const pcmData = new Int16Array(event.data);
+          const floatData = new Float32Array(pcmData.length);
+          for (let i = 0; i < pcmData.length; i++) {
+            floatData[i] = pcmData[i] / 32768.0;
+          }
+
+          const audioBuffer = audioCtx.createBuffer(1, floatData.length, 16000);
+          audioBuffer.copyToChannel(floatData, 0);
+
+          const sourceNode = audioCtx.createBufferSource();
+          sourceNode.buffer = audioBuffer;
+
+          gainNode.gain.value = isMutedRef.current ? 0 : volumeRef.current;
+          sourceNode.connect(gainNode);
+
+          const startTime = Math.max(nextPlayTime, audioCtx.currentTime);
+          sourceNode.start(startTime);
+
+          const chunkDuration = floatData.length / 16000;
+          nextPlayTime = startTime + chunkDuration;
+        } catch (err) {
+          console.error('[SimulationWS] Audio playback error:', err);
+        }
+      }
+    };
+
+    ws.onclose = () => {
+      console.log('[SimulationWS] Simulation trigger WebSocket closed.');
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+      }
+    };
+    return () => {
+      ws.close();
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+      }
+    };
+  }, [id]);
+
   // Accordion open/close toggles for Live Interview view
   const [isTranscriptExpanded, setIsTranscriptExpanded] = useState<boolean>(false);
   const [isJdCoverageExpanded, setIsJdCoverageExpanded] = useState<boolean>(false);
   const [isResumeCoverageExpanded, setIsResumeCoverageExpanded] = useState<boolean>(false);
   const [isAllQuestionsExpanded, setIsAllQuestionsExpanded] = useState<boolean>(false);
+
+  // Auto-scroll ref for Live Transcript Log container
+  const transcriptContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (transcriptContainerRef.current && isTranscriptExpanded) {
+      transcriptContainerRef.current.scrollTo({
+        top: transcriptContainerRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+  }, [transcript, isTranscriptExpanded]);
 
   // Helper to determine the status of the candidate's latest evaluated answer
   const getLatestAnswerStatus = () => {
@@ -69,7 +213,7 @@ export const CopilotSession: React.FC = () => {
         const res = await getCopilotStatus(id);
         const active = (res as any).is_active;
         if (active === false) {
-          setUiMode('report'); // Auto-transition on session finish
+          setIsSimulationFinished(true);
         }
       } catch (err) {
         console.error('Failed to query session status:', err);
@@ -218,6 +362,41 @@ export const CopilotSession: React.FC = () => {
 
         {uiMode === 'live' && (
           <div className="flex items-center gap-3 self-end sm:self-auto">
+            {/* View Final Results Button */}
+            <button
+              onClick={async () => {
+                if (!id) return;
+                setIsGeneratingReport(true);
+                try {
+                  await finalizeCopilotReport(id);
+                  setUiMode('report');
+                } catch (err) {
+                  console.error('Failed to compile final report:', err);
+                  setUiMode('report');
+                } finally {
+                  setIsGeneratingReport(false);
+                }
+              }}
+              disabled={isGeneratingReport}
+              className={`flex items-center gap-2 px-4 py-2 text-white text-xs font-bold rounded-lg shadow-md transition-all cursor-pointer border ${
+                isSimulationFinished
+                  ? 'bg-green-600 hover:bg-green-700 border-green-700 animate-bounce'
+                  : 'bg-primary hover:bg-primary/90 border-primary'
+              }`}
+            >
+              {isGeneratingReport ? (
+                <>
+                  <div className="animate-spin rounded-full h-3.5 w-3.5 border-b-2 border-white" />
+                  Compiling Report...
+                </>
+              ) : (
+                <>
+                  <FileText className="h-4 w-4" />
+                  View Final Results
+                </>
+              )}
+            </button>
+
             {/* Status Indicator */}
             <div className="flex items-center gap-2 px-3 py-1.5 bg-white rounded-lg border border-border-gray">
               <span className={`h-2.5 w-2.5 rounded-full ${
@@ -258,6 +437,50 @@ export const CopilotSession: React.FC = () => {
       {/* Main Grid Workspace */}
       {uiMode === 'live' ? (
         <div className="space-y-6 animate-fade-in">
+          {/* Simulation Audio Control Bar */}
+          {isSimulation && (
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-primary text-white rounded-lg">
+                  <Volume2 className="h-4 w-4 animate-pulse" />
+                </div>
+                <div>
+                  <span className="text-xs font-bold text-primary block">Simulation Audio Live Stream</span>
+                  <span className="text-[10px] text-muted-gray">
+                    {isSimulationFinished ? 'Recording Finished. Click "View Final Results" to compile dossier.' : 'Playing test WAV audio through browser speakers in sync with suggestions.'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-4 self-end sm:self-auto">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-muted-gray font-bold uppercase">Volume:</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={volume}
+                    onChange={(e) => setVolume(parseFloat(e.target.value))}
+                    className="w-24 accent-primary cursor-pointer"
+                  />
+                </div>
+
+                <button
+                  onClick={() => setIsMuted(!isMuted)}
+                  className={`p-2 rounded-lg text-xs font-bold border transition-all flex items-center gap-1.5 ${
+                    isMuted
+                      ? 'bg-red-50 text-red-600 border-red-200'
+                      : 'bg-white text-primary border-border-gray hover:bg-secondary'
+                  }`}
+                >
+                  {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                  {isMuted ? 'Muted' : 'Mute'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* HUD Cards Grid */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {/* Current Topic Card */}
@@ -294,105 +517,215 @@ export const CopilotSession: React.FC = () => {
             </div>
           </div>
 
-          {/* Primary Suggestions Area */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Left Box: Recommended Questions */}
-            <div className="bg-secondary rounded-xl p-5 border border-border-gray shadow-sm flex flex-col gap-4 min-h-[300px]">
-              <h3 className="font-bold text-primary flex items-center gap-2 text-sm border-b border-border-gray pb-2.5">
-                <User className="h-4 w-4 text-primary" />
-                Recommended Questions
-              </h3>
-              <div className="flex-1 overflow-y-auto space-y-4 pr-1">
-                {status !== 'connected' ? (
-                  <div className="h-full flex flex-col items-center justify-center text-center text-muted-gray py-8 gap-1.5">
-                    <MessageSquare className="h-8 w-8 stroke-[1.5]" />
-                    <p className="text-sm font-bold">Suggestions Stream Offline</p>
-                    <p className="text-xs">Connect voice/text channel to start receiving live interviewer assistance tips.</p>
-                  </div>
-                ) : (
-                  (() => {
-                    const allQuestions = [
-                      ...(assistance.suggested_follow_up_questions || []).map(q => ({
-                        text: q,
-                        type: 'Follow-up',
-                        color: 'bg-purple-50 text-purple-700 border-purple-200'
-                      })),
-                      ...(assistance.verification_questions || []).map(q => ({
-                        text: q,
-                        type: 'Verification',
-                        color: 'bg-amber-50 text-amber-700 border-amber-200'
-                      })),
-                      ...(assistance.suggested_practical_questions || []).map(q => ({
-                        text: q,
-                        type: 'Scenario',
-                        color: 'bg-blue-50 text-blue-700 border-blue-200'
-                      }))
-                    ];
-
-                    if (allQuestions.length === 0) {
-                      return (
-                        <div className="h-full flex flex-col items-center justify-center text-center text-muted-gray py-8">
-                          <p className="text-xs italic">No recommended questions at this stage.</p>
-                        </div>
-                      );
-                    }
-
-                    const visibleQuestions = isAllQuestionsExpanded ? allQuestions : allQuestions.slice(0, 3);
-
+          {/* Pinned Questions Section (if any question is pinned) */}
+          {(() => {
+            const pinnedList = questions.filter((q) => q.isPinned);
+            if (pinnedList.length === 0) return null;
+            return (
+              <div className="bg-amber-50/70 rounded-xl p-4 border border-amber-200 shadow-sm space-y-3">
+                <div className="flex items-center justify-between border-b border-amber-200/80 pb-2">
+                  <h4 className="font-bold text-amber-900 flex items-center gap-2 text-xs uppercase tracking-wider">
+                    <Pin className="h-4 w-4 text-amber-700 fill-amber-600" />
+                    Pinned Questions ({pinnedList.length})
+                  </h4>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {pinnedList.map((q) => {
+                    const badgeColor =
+                      q.type === 'Follow-up'
+                        ? 'bg-purple-50 text-purple-700 border-purple-200'
+                        : q.type === 'Verification'
+                        ? 'bg-amber-50 text-amber-700 border-amber-200'
+                        : 'bg-blue-50 text-blue-700 border-blue-200';
                     return (
-                      <div className="space-y-3">
-                        <div className="space-y-2">
-                          {visibleQuestions.map((q, idx) => (
-                            <div key={idx} className="bg-white rounded-lg p-2.5 border border-border-gray/80 text-xs text-primary shadow-sm leading-relaxed flex flex-col gap-1.5 items-start">
-                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${q.color}`}>
-                                {q.type}
-                              </span>
-                              <span>{q.text}</span>
-                            </div>
-                          ))}
-                        </div>
-
-                        {allQuestions.length > 3 && (
+                      <div
+                        key={q.id}
+                        className="bg-white rounded-lg p-3 border border-amber-300 shadow-sm text-xs text-primary flex flex-col justify-between gap-2.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${badgeColor}`}>
+                            {q.type}
+                          </span>
                           <button
-                            onClick={() => setIsAllQuestionsExpanded(!isAllQuestionsExpanded)}
-                            className="text-xs font-bold text-primary hover:underline text-left mt-2 block"
+                            onClick={() => togglePinQuestion(q.id)}
+                            title="Unpin Question"
+                            className="p-1 text-amber-600 hover:text-amber-800 rounded hover:bg-amber-100/60 transition-colors"
                           >
-                            {isAllQuestionsExpanded ? 'Show Less' : `Show All Recommended Questions (${allQuestions.length})`}
+                            <Pin className="h-3.5 w-3.5 fill-amber-500" />
                           </button>
-                        )}
+                        </div>
+                        <p className="leading-relaxed font-medium">{q.text}</p>
                       </div>
                     );
-                  })()
-                )}
+                  })}
+                </div>
               </div>
-            </div>
+            );
+          })()}
 
-            {/* Right Box: Short Interview Notes */}
-            <div className="bg-secondary rounded-xl p-5 border border-border-gray shadow-sm flex flex-col gap-4 min-h-[300px]">
-              <h3 className="font-bold text-primary flex items-center gap-2 text-sm border-b border-border-gray pb-2.5">
-                <FileText className="h-4 w-4 text-primary" />
-                Interviewer / Observer Notes
-              </h3>
-              <div className="flex-1 overflow-y-auto space-y-3 pr-1">
-                {status !== 'connected' ? (
-                  <p className="text-xs text-muted-gray text-center py-8">Notes stream offline.</p>
-                ) : (
-                  <>
-                    {assistance.interview_notes && assistance.interview_notes.length > 0 ? (
-                      <ul className="space-y-2 bg-white rounded-lg p-4 border border-border-gray text-xs text-primary list-disc list-inside">
-                        {assistance.interview_notes.map((note, idx) => (
-                          <li key={idx} className="leading-relaxed mb-1 font-medium">{note}</li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-center text-muted-gray py-8">
-                        <p className="text-xs italic">No observer notes logged yet. Notes will populate as the conversation progresses.</p>
+          {/* Primary Suggestions Area: 3 Horizontal Containers (Follow-up | Verification | Scenario) */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Column 1: Follow-up Questions */}
+            {(() => {
+              const list = questions.filter((q) => q.type === 'Follow-up');
+              return (
+                <div className="bg-secondary rounded-xl p-4 border border-border-gray shadow-sm flex flex-col gap-3 min-h-[300px]">
+                  <h3 className="font-bold text-primary flex items-center justify-between text-xs uppercase tracking-wider border-b border-border-gray pb-2.5">
+                    <span className="flex items-center gap-1.5 text-purple-700 font-semibold">
+                      <User className="h-4 w-4" />
+                      Follow-up Questions
+                    </span>
+                    <span className="bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                      {list.length}
+                    </span>
+                  </h3>
+                  <div className="flex-1 overflow-y-auto space-y-2.5 max-h-[350px] pr-1">
+                    {status !== 'connected' ? (
+                      <p className="text-xs text-muted-gray text-center py-8">Offline</p>
+                    ) : list.length === 0 ? (
+                      <div className="h-full flex items-center justify-center text-center text-muted-gray py-8">
+                        <p className="text-xs italic">No follow-up questions yet.</p>
                       </div>
+                    ) : (
+                      list.map((q) => (
+                        <div
+                          key={q.id}
+                          className={`bg-white rounded-lg p-3 border text-xs text-primary shadow-sm leading-relaxed flex flex-col gap-2 transition-all ${
+                            q.isPinned ? 'border-amber-400 ring-1 ring-amber-300' : 'border-border-gray/80 hover:border-purple-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-purple-50 text-purple-700 border-purple-200">
+                              Follow-up
+                            </span>
+                            <button
+                              onClick={() => togglePinQuestion(q.id)}
+                              title={q.isPinned ? 'Unpin question' : 'Pin question'}
+                              className={`p-1 rounded transition-colors ${
+                                q.isPinned
+                                  ? 'text-amber-600 hover:text-amber-800 bg-amber-50'
+                                  : 'text-gray-400 hover:text-amber-600 hover:bg-gray-100'
+                              }`}
+                            >
+                              <Pin className={`h-3.5 w-3.5 ${q.isPinned ? 'fill-amber-500' : ''}`} />
+                            </button>
+                          </div>
+                          <span>{q.text}</span>
+                        </div>
+                      ))
                     )}
-                  </>
-                )}
-              </div>
-            </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Column 2: Verification Questions */}
+            {(() => {
+              const list = questions.filter((q) => q.type === 'Verification');
+              return (
+                <div className="bg-secondary rounded-xl p-4 border border-border-gray shadow-sm flex flex-col gap-3 min-h-[300px]">
+                  <h3 className="font-bold text-primary flex items-center justify-between text-xs uppercase tracking-wider border-b border-border-gray pb-2.5">
+                    <span className="flex items-center gap-1.5 text-amber-700 font-semibold">
+                      <CheckCircle className="h-4 w-4" />
+                      Verification Questions
+                    </span>
+                    <span className="bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                      {list.length}
+                    </span>
+                  </h3>
+                  <div className="flex-1 overflow-y-auto space-y-2.5 max-h-[350px] pr-1">
+                    {status !== 'connected' ? (
+                      <p className="text-xs text-muted-gray text-center py-8">Offline</p>
+                    ) : list.length === 0 ? (
+                      <div className="h-full flex items-center justify-center text-center text-muted-gray py-8">
+                        <p className="text-xs italic">No verification questions yet.</p>
+                      </div>
+                    ) : (
+                      list.map((q) => (
+                        <div
+                          key={q.id}
+                          className={`bg-white rounded-lg p-3 border text-xs text-primary shadow-sm leading-relaxed flex flex-col gap-2 transition-all ${
+                            q.isPinned ? 'border-amber-400 ring-1 ring-amber-300' : 'border-border-gray/80 hover:border-amber-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-amber-50 text-amber-700 border-amber-200">
+                              Verification
+                            </span>
+                            <button
+                              onClick={() => togglePinQuestion(q.id)}
+                              title={q.isPinned ? 'Unpin question' : 'Pin question'}
+                              className={`p-1 rounded transition-colors ${
+                                q.isPinned
+                                  ? 'text-amber-600 hover:text-amber-800 bg-amber-50'
+                                  : 'text-gray-400 hover:text-amber-600 hover:bg-gray-100'
+                              }`}
+                            >
+                              <Pin className={`h-3.5 w-3.5 ${q.isPinned ? 'fill-amber-500' : ''}`} />
+                            </button>
+                          </div>
+                          <span>{q.text}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Column 3: Scenario Questions */}
+            {(() => {
+              const list = questions.filter((q) => q.type === 'Scenario');
+              return (
+                <div className="bg-secondary rounded-xl p-4 border border-border-gray shadow-sm flex flex-col gap-3 min-h-[300px]">
+                  <h3 className="font-bold text-primary flex items-center justify-between text-xs uppercase tracking-wider border-b border-border-gray pb-2.5">
+                    <span className="flex items-center gap-1.5 text-blue-700 font-semibold">
+                      <BookOpen className="h-4 w-4" />
+                      Scenario Questions
+                    </span>
+                    <span className="bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                      {list.length}
+                    </span>
+                  </h3>
+                  <div className="flex-1 overflow-y-auto space-y-2.5 max-h-[350px] pr-1">
+                    {status !== 'connected' ? (
+                      <p className="text-xs text-muted-gray text-center py-8">Offline</p>
+                    ) : list.length === 0 ? (
+                      <div className="h-full flex items-center justify-center text-center text-muted-gray py-8">
+                        <p className="text-xs italic">No scenario questions yet.</p>
+                      </div>
+                    ) : (
+                      list.map((q) => (
+                        <div
+                          key={q.id}
+                          className={`bg-white rounded-lg p-3 border text-xs text-primary shadow-sm leading-relaxed flex flex-col gap-2 transition-all ${
+                            q.isPinned ? 'border-amber-400 ring-1 ring-amber-300' : 'border-border-gray/80 hover:border-blue-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-blue-50 text-blue-700 border-blue-200">
+                              Scenario
+                            </span>
+                            <button
+                              onClick={() => togglePinQuestion(q.id)}
+                              title={q.isPinned ? 'Unpin question' : 'Pin question'}
+                              className={`p-1 rounded transition-colors ${
+                                q.isPinned
+                                  ? 'text-amber-600 hover:text-amber-800 bg-amber-50'
+                                  : 'text-gray-400 hover:text-amber-600 hover:bg-gray-100'
+                              }`}
+                            >
+                              <Pin className={`h-3.5 w-3.5 ${q.isPinned ? 'fill-amber-500' : ''}`} />
+                            </button>
+                          </div>
+                          <span>{q.text}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
 
           {/* Collapsible Accordion Sections */}
@@ -412,12 +745,13 @@ export const CopilotSession: React.FC = () => {
               </button>
 
               {isTranscriptExpanded && (
-                <div className="border-t border-border-gray p-4 max-h-[400px] overflow-y-auto space-y-4 bg-white">
+                <div ref={transcriptContainerRef} className="border-t border-border-gray p-4 max-h-[400px] overflow-y-auto space-y-4 bg-white">
                   {transcript.length === 0 ? (
                     <p className="text-xs text-muted-gray text-center py-4">No transcript logged yet.</p>
                   ) : (
                     transcript.map((msg, index) => {
                       const isCandidate = msg.speaker === 'Candidate';
+                      const isInterviewer = msg.speaker === 'Interviewer';
                       const isSystem = msg.speaker === 'System';
 
                       if (isSystem) {
@@ -435,10 +769,16 @@ export const CopilotSession: React.FC = () => {
                           key={index} 
                           className={`flex flex-col gap-1.5 ${isCandidate ? 'items-start' : 'items-end'}`}
                         >
-                          <span className="text-[10px] font-bold text-muted-gray px-1">
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${
+                            isCandidate
+                              ? 'bg-blue-50 text-blue-700 border-blue-200'
+                              : isInterviewer
+                              ? 'bg-purple-50 text-purple-700 border-purple-200'
+                              : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          }`}>
                             {msg.speaker}
                           </span>
-                          <div className={`group relative rounded-xl p-3 max-w-[90%] border shadow-sm transition-all ${
+                          <div className={`group relative rounded-xl p-3 max-w-[85%] border shadow-sm transition-all ${
                             isCandidate 
                               ? 'bg-white border-border-gray text-primary' 
                               : 'bg-primary text-white border-primary/30'
@@ -450,28 +790,6 @@ export const CopilotSession: React.FC = () => {
                               {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                             </span>
                           </div>
-                          {/* Interview Decision badge for candidate answers in live log */}
-                          {isCandidate && msg.evaluation && (
-                            <div className="mt-1">
-                              <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[9px] border font-bold ${
-                                (() => {
-                                  const rating = msg.evaluation?.technical_accuracy?.rating;
-                                  if (rating === undefined) return 'text-muted-gray bg-gray-50 border-gray-200';
-                                  if (rating >= 80) return 'text-green-700 bg-green-50 border-green-200';
-                                  if (rating >= 50) return 'text-amber-700 bg-amber-50 border-amber-200';
-                                  return 'text-red-700 bg-red-50 border-red-200';
-                                })()
-                              }`}>
-                                Interview Decision: {(() => {
-                                  const rating = msg.evaluation?.technical_accuracy?.rating;
-                                  if (rating === undefined) return 'Evaluating...';
-                                  if (rating >= 80) return 'Strong Answer';
-                                  if (rating >= 50) return 'Partial Answer';
-                                  return 'Weak Answer';
-                                })()}
-                              </span>
-                            </div>
-                          )}
                         </div>
                       );
                     })

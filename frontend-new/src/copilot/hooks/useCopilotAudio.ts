@@ -61,6 +61,14 @@ export interface CopilotAssistance {
   current_candidate_understanding: string;
 }
 
+export interface CopilotQuestionItem {
+  id: string;
+  type: 'Follow-up' | 'Verification' | 'Scenario';
+  text: string;
+  isPinned: boolean;
+  timestamp: number;
+}
+
 export const useCopilotAudio = (sessionId: string | null) => {
   const [status, setStatus] = useState<CopilotConnectionStatus>('disconnected');
   const [error, setError] = useState<string | null>(null);
@@ -86,6 +94,46 @@ export const useCopilotAudio = (sessionId: string | null) => {
     current_candidate_understanding: ''
   });
 
+  // Cumulative questions state with pinning support
+  const [questions, setQuestions] = useState<CopilotQuestionItem[]>([]);
+
+  const togglePinQuestion = (id: string) => {
+    setQuestions((prev) =>
+      prev.map((q) => (q.id === id ? { ...q, isPinned: !q.isPinned } : q))
+    );
+  };
+
+  const processIncomingQuestions = (assist: CopilotAssistance) => {
+    setQuestions((prev) => {
+      const existingTexts = new Set(prev.map((q) => q.text.trim().toLowerCase()));
+      const newItems: CopilotQuestionItem[] = [];
+
+      const addItems = (list: string[] | undefined, type: 'Follow-up' | 'Verification' | 'Scenario') => {
+        if (!Array.isArray(list)) return;
+        list.forEach((text) => {
+          const trimmed = text.trim();
+          if (trimmed && !existingTexts.has(trimmed.toLowerCase())) {
+            existingTexts.add(trimmed.toLowerCase());
+            newItems.push({
+              id: `${type}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+              type,
+              text: trimmed,
+              isPinned: false,
+              timestamp: Date.now()
+            });
+          }
+        });
+      };
+
+      addItems(assist.suggested_follow_up_questions, 'Follow-up');
+      addItems(assist.verification_questions, 'Verification');
+      addItems(assist.suggested_practical_questions, 'Scenario');
+
+      if (newItems.length === 0) return prev;
+      return [...prev, ...newItems];
+    });
+  };
+
   const socketRef = useRef<WebSocket | null>(null);
 
   const startConnection = async () => {
@@ -101,6 +149,7 @@ export const useCopilotAudio = (sessionId: string | null) => {
       ws.onopen = () => {
         console.log('[CopilotWS] Connected to copilot session stream');
         setStatus('connected');
+        setError(null);
       };
 
       ws.onmessage = (event) => {
@@ -112,10 +161,27 @@ export const useCopilotAudio = (sessionId: string | null) => {
               setTranscript(data.transcript);
             }
             if (data.intelligence) {
-              setIntelligence(data.intelligence);
+              try {
+                const parsedIntel = typeof data.intelligence === 'string'
+                  ? JSON.parse(data.intelligence.replace(/```json/g, '').replace(/```/g, '').trim())
+                  : data.intelligence;
+                setIntelligence(parsedIntel);
+              } catch (intelErr) {
+                console.warn('[CopilotWS] Error parsing intelligence JSON:', intelErr);
+                setIntelligence(data.intelligence);
+              }
             }
             if (data.assistance) {
-              setAssistance(data.assistance);
+              try {
+                const parsedAssist: CopilotAssistance = typeof data.assistance === 'string'
+                  ? JSON.parse(data.assistance.replace(/```json/g, '').replace(/```/g, '').trim())
+                  : data.assistance;
+                setAssistance(parsedAssist);
+                processIncomingQuestions(parsedAssist);
+              } catch (assistErr) {
+                console.warn('[CopilotWS] Error parsing assistance JSON:', assistErr);
+                setAssistance(data.assistance);
+              }
             }
           }
         } catch (err) {
@@ -170,6 +236,8 @@ export const useCopilotAudio = (sessionId: string | null) => {
     transcript,
     intelligence,
     assistance,
+    questions,
+    togglePinQuestion,
     startConnection,
     stopConnection,
     sendMessage,
